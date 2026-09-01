@@ -91,6 +91,67 @@ describe('Fairness (on-chain provably-fair verifier)', () => {
         expect(res.transactions).toHaveTransaction({ from: stranger.address, to: fairness.address, success: false });
     });
 
+    const findNonce = (seed: string, client: string, pred: (c: bigint) => boolean) => {
+        for (let n = 0; n < 400; n++) if (pred(crashOffchain(seed, client, n))) return n;
+        throw new Error('no matching nonce');
+    };
+
+    it('pays out a winning bet automatically on reveal', async () => {
+        const seed = 'escrow-seed-win', client = 'winner';
+        const nonce = findNonce(seed, client, c => c >= 250n); // crash >= 2.5x
+        const target = 200n;                                    // bet on 2.0x -> wins
+
+        await fairness.send(owner.getSender(), { value: toNano('0.05') },
+            { $$type: 'Commit', commitment: commit(seed) });
+        await fairness.send(owner.getSender(), { value: toNano('5') }, 'fund'); // bankroll
+
+        await fairness.send(stranger.getSender(), { value: toNano('1') },
+            { $$type: 'PlaceBet', target, clientSeed: client, nonce: BigInt(nonce) });
+        expect((await fairness.getBetOf(stranger.address))!.target).toBe(target);
+
+        const res = await fairness.send(owner.getSender(), { value: toNano('0.05') },
+            { $$type: 'Reveal', serverSeed: seed });
+
+        // contract sends the payout back to the bettor
+        expect(res.transactions).toHaveTransaction({
+            from: fairness.address, to: stranger.address, success: true,
+        });
+        expect(await fairness.getBetOf(stranger.address)).toBeNull(); // cleared
+    });
+
+    it('keeps the stake when the bet loses', async () => {
+        const seed = 'escrow-seed-lose', client = 'loser';
+        const nonce = findNonce(seed, client, c => c >= 101n && c < 170n); // low crash
+        const target = 200n;                                               // 2.0x -> loses
+
+        await fairness.send(owner.getSender(), { value: toNano('0.05') },
+            { $$type: 'Commit', commitment: commit(seed) });
+        await fairness.send(owner.getSender(), { value: toNano('5') }, 'fund');
+        await fairness.send(stranger.getSender(), { value: toNano('1') },
+            { $$type: 'PlaceBet', target, clientSeed: client, nonce: BigInt(nonce) });
+
+        const res = await fairness.send(owner.getSender(), { value: toNano('0.05') },
+            { $$type: 'Reveal', serverSeed: seed });
+
+        expect(res.transactions).not.toHaveTransaction({
+            from: fairness.address, to: stranger.address,
+        });
+    });
+
+    it('rejects a bet once the round is revealed', async () => {
+        const seed = 'escrow-late';
+        await fairness.send(owner.getSender(), { value: toNano('0.05') },
+            { $$type: 'Commit', commitment: commit(seed) });
+        await fairness.send(owner.getSender(), { value: toNano('0.05') },
+            { $$type: 'Reveal', serverSeed: seed });
+
+        const res = await fairness.send(stranger.getSender(), { value: toNano('1') },
+            { $$type: 'PlaceBet', target: 200n, clientSeed: 'x', nonce: 0n });
+        expect(res.transactions).toHaveTransaction({
+            from: stranger.address, to: fairness.address, success: false,
+        });
+    });
+
     it('supports multiple rounds via reset', async () => {
         for (let i = 0; i < 3; i++) {
             const seed = `round-${i}-seed`;
