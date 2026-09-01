@@ -6,6 +6,17 @@ import '@ton/test-utils';
 
 const commit = (seed: string) => BigInt('0x' + sha256_sync(seed).toString('hex'));
 
+// Same multiplier formula as the contract, computed off-chain to cross-check.
+const E = 4503599627370496n; // 2^52
+function crashOffchain(seed: string, clientSeed: string, nonce: number): bigint {
+    const hash = BigInt('0x' + sha256_sync(`${seed}:${clientSeed}:${nonce}`).toString('hex'));
+    let h = hash >> 204n;
+    if (h === 0n) h = 1n;
+    let x100 = (100n * E - h) / (E - h);
+    if (x100 < 100n) x100 = 100n;
+    return x100;
+}
+
 describe('Fairness (on-chain provably-fair verifier)', () => {
     let blockchain: Blockchain;
     let owner: SandboxContract<TreasuryContract>;
@@ -51,6 +62,27 @@ describe('Fairness (on-chain provably-fair verifier)', () => {
 
         expect(res.transactions).toHaveTransaction({ from: owner.address, to: fairness.address, success: false });
         expect(await fairness.getVerified()).toBe(false);
+    });
+
+    it('derives the crash multiplier on-chain, matching the off-chain formula', async () => {
+        const seed = 'abyss-round-0001-secret';
+        const client = 'player-seed-xyz';
+        await fairness.send(owner.getSender(), { value: toNano('0.05') },
+            { $$type: 'Commit', commitment: commit(seed) });
+        await fairness.send(owner.getSender(), { value: toNano('0.05') },
+            { $$type: 'Reveal', serverSeed: seed });
+
+        for (const nonce of [0, 1, 7, 42, 1000]) {
+            const onChain = await fairness.getCrashPoint(client, BigInt(nonce));
+            expect(onChain).toBe(crashOffchain(seed, client, nonce));
+            expect(onChain).toBeGreaterThanOrEqual(100n); // never below 1.00x
+        }
+    });
+
+    it('returns 0 for the multiplier before the seed is revealed', async () => {
+        await fairness.send(owner.getSender(), { value: toNano('0.05') },
+            { $$type: 'Commit', commitment: commit('secret') });
+        expect(await fairness.getCrashPoint('client', 0n)).toBe(0n);
     });
 
     it('only the owner can commit', async () => {
