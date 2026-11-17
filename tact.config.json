@@ -4,7 +4,7 @@
     {
       "name": "Fairness",
       "path": "contracts/fairness.tact",
-      "output": "build\\Fairness",
+      "output": "build/Fairness",
       "options": {
         "debug": false,
         "external": false
