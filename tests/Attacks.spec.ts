@@ -1,91 +1,65 @@
-// Attacks on the first version of the contract. Every test here passes against that
-// version, which means every attack works. The next commit fixes the contract and
-// replaces these tests with ones that show each attack failing.
-import { Blockchain, SandboxContract, TreasuryContract } from '@ton/sandbox';
+// The attacks that worked on the first version of the contract, run against the
+// current one. Each of them now fails.
 import { toNano } from '@ton/core';
-import { sha256_sync } from '@ton/crypto';
-import { Fairness } from '../build/Fairness/Fairness_Fairness';
 import '@ton/test-utils';
+import { commit, crash, findNonce, payoutFor, setup, open, bet, reveal, closeBetting } from './helpers';
 
-const commit = (seed: string) => BigInt('0x' + sha256_sync(seed).toString('hex'));
-const E = 4503599627370496n;
-function crash(seed: string, clientSeed: string, nonce: number): bigint {
-    let h = BigInt('0x' + sha256_sync(`${seed}:${clientSeed}:${nonce}`).toString('hex')) >> 204n;
-    if (h === 0n) h = 1n;
-    const x100 = (100n * E - h) / (E - h);
-    return x100 < 100n ? 100n : x100;
-}
-const findNonce = (seed: string, client: string, pred: (c: bigint) => boolean) => {
-    for (let n = 0; n < 10_000; n++) if (pred(crash(seed, client, n))) return n;
-    throw new Error('no nonce');
-};
+describe('attacks on the first version, now', () => {
+    it('the owner cannot replace the commitment after seeing the bets', async () => {
+        const g = await setup();
+        const player = await g.chain.treasury('player');
+        const nonce = findNonce('honest-seed', 'player-1', x => x >= 300n);
+        await open(g, 'honest-seed');
+        await bet(g, player, 200n, 'player-1', nonce);
 
-describe('attacks on the first version', () => {
-    let chain: Blockchain;
-    let owner: SandboxContract<TreasuryContract>;
-    let player: SandboxContract<TreasuryContract>;
-    let game: SandboxContract<Fairness>;
-
-    beforeEach(async () => {
-        chain = await Blockchain.create();
-        owner = await chain.treasury('owner');
-        player = await chain.treasury('player');
-        game = chain.openContract(await Fairness.fromInit(owner.address));
-        await game.send(owner.getSender(), { value: toNano('0.05') }, { $$type: 'Deploy', queryId: 0n });
+        let other = '';
+        for (let i = 0; ; i++) { other = `other-${i}`; if (crash(other, 'player-1', nonce) < 200n) break; }
+        const swap = await g.game.send(g.owner.getSender(), { value: toNano('0.05') },
+            { $$type: 'Open', commitment: commit(other), betWindow: 60n });
+        expect(swap.transactions).toHaveTransaction({ to: g.game.address, success: false });
+        closeBetting(g);
+        expect((await reveal(g, other)).transactions).toHaveTransaction({ to: g.game.address, success: false });
+        expect((await reveal(g, 'honest-seed')).transactions)
+            .toHaveTransaction({ from: g.game.address, to: player.address, value: payoutFor(toNano('1'), 200n) });
     });
 
-    it('the owner replaces the commitment after seeing the bets', async () => {
-        const seedA = 'honest-seed', client = 'player-1';
-        const nonce = findNonce(seedA, client, c => c >= 300n);   // with seed A the 2x bet wins
-        await game.send(owner.getSender(), { value: toNano('0.05') }, { $$type: 'Commit', commitment: commit(seedA) });
-        await game.send(owner.getSender(), { value: toNano('10') }, 'fund');
-        await game.send(player.getSender(), { value: toNano('1') },
-            { $$type: 'PlaceBet', target: 200n, clientSeed: client, nonce: BigInt(nonce) });
-
-        // The bet is public, so the owner looks for a seed under which it loses.
-        let seedB = '';
-        for (let i = 0; ; i++) { seedB = `other-${i}`; if (crash(seedB, client, nonce) < 200n) break; }
-        const swap = await game.send(owner.getSender(), { value: toNano('0.05') }, { $$type: 'Commit', commitment: commit(seedB) });
-        expect(swap.transactions).toHaveTransaction({ to: game.address, success: true });
-
-        const reveal = await game.send(owner.getSender(), { value: toNano('0.05') }, { $$type: 'Reveal', serverSeed: seedB });
-        expect(reveal.transactions).toHaveTransaction({ to: game.address, success: true });
-        expect(reveal.transactions).not.toHaveTransaction({ from: game.address, to: player.address });
-        expect(await game.getVerified()).toBe(true);
-    });
-
-    it('76 bets make the round impossible to reveal, and nothing can be withdrawn', async () => {
-        const seed = 'crowded-round';
-        await game.send(owner.getSender(), { value: toNano('0.05') }, { $$type: 'Commit', commitment: commit(seed) });
-        await game.send(owner.getSender(), { value: toNano('100') }, 'fund');
-        for (let i = 0; i < 76; i++) {
-            const p = await chain.treasury(`p${i}`);
-            await game.send(p.getSender(), { value: toNano('0.03') },
-                { $$type: 'PlaceBet', target: 101n, clientSeed: `c${i}`, nonce: 0n });
-        }
-        const reveal = await game.send(owner.getSender(), { value: toNano('1') }, { $$type: 'Reveal', serverSeed: seed });
-        expect(reveal.transactions).toHaveTransaction({ to: game.address, success: false, exitCode: -14 }); // out of gas
-        expect(await game.getVerified()).toBe(false);
-        // The contract has no refund and no withdraw: the 100 TON bankroll and the stakes stay where they are.
-        expect((await chain.getContract(game.address)).balance).toBeGreaterThan(toNano('100'));
+    it('a crowded round still settles: 100 bets', async () => {
+        const g = await setup('100');
+        await open(g, 'crowded');
+        for (let i = 0; i < 100; i++) await bet(g, await g.chain.treasury(`p${i}`), 101n, `c${i}`, 0n, toNano('0.1'));
+        closeBetting(g);
+        await reveal(g, 'crowded');
+        expect(await g.game.getSettledCount()).toBe(100n);
+        expect(await g.game.getPhase()).toBe(0n);
     }, 120_000);
 
-    it('a win the bankroll cannot cover is dropped without an error', async () => {
-        const seed = 'empty-bank', client = 'lucky';
-        const nonce = findNonce(seed, client, c => c >= 1000n);
-        await game.send(owner.getSender(), { value: toNano('0.05') }, { $$type: 'Commit', commitment: commit(seed) });
-        await game.send(player.getSender(), { value: toNano('1') },
-            { $$type: 'PlaceBet', target: 1000n, clientSeed: client, nonce: BigInt(nonce) });
-        const reveal = await game.send(owner.getSender(), { value: toNano('0.05') }, { $$type: 'Reveal', serverSeed: seed });
-        expect(reveal.transactions).toHaveTransaction({ from: owner.address, to: game.address, success: true });
-        expect(reveal.transactions).not.toHaveTransaction({ from: game.address, to: player.address });
-        expect(await game.getBetOf(player.address)).toBeNull();
+    it('a win the bankroll could not cover is never accepted as a bet', async () => {
+        const g = await setup('0.6');
+        const player = await g.chain.treasury('player');
+        await open(g, 'empty-bank');
+        expect((await bet(g, player, 1000n, 'lucky', 0n)).transactions)
+            .toHaveTransaction({ from: player.address, to: g.game.address, success: false });
     });
 
-    it('a second bet from the same wallet replaces the first', async () => {
-        await game.send(owner.getSender(), { value: toNano('0.05') }, { $$type: 'Commit', commitment: commit('s') });
-        await game.send(player.getSender(), { value: toNano('5') }, { $$type: 'PlaceBet', target: 150n, clientSeed: 'a', nonce: 1n });
-        await game.send(player.getSender(), { value: toNano('1') }, { $$type: 'PlaceBet', target: 150n, clientSeed: 'a', nonce: 2n });
-        expect((await game.getBetOf(player.address))!.amount).toBe(toNano('0.98'));
+    it('a second bet from the same wallet is kept and settled', async () => {
+        const g = await setup('20');
+        const player = await g.chain.treasury('player');
+        await open(g, 'two-bets');
+        await bet(g, player, 101n, 'a', findNonce('two-bets', 'a', x => x >= 101n), toNano('5'));
+        await bet(g, player, 101n, 'a', findNonce('two-bets', 'a', x => x >= 101n), toNano('1'));
+        expect(await g.game.getBetCount()).toBe(2n);
+        closeBetting(g);
+        const res = await reveal(g, 'two-bets');
+        expect(res.transactions).toHaveTransaction({ from: g.game.address, to: player.address, value: payoutFor(toNano('5'), 101n) });
+        expect(res.transactions).toHaveTransaction({ from: g.game.address, to: player.address, value: payoutFor(toNano('1'), 101n) });
+    });
+
+    it('nobody can bet once the seed may be revealed', async () => {
+        const g = await setup();
+        const player = await g.chain.treasury('player');
+        await open(g, 'race');
+        closeBetting(g);
+        expect((await bet(g, player, 200n, 'p', 0n)).transactions)
+            .toHaveTransaction({ from: player.address, to: g.game.address, success: false });
     });
 });

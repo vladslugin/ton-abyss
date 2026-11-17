@@ -1,8 +1,8 @@
 # How the crash multiplier works
 
-A short write-up of the one function that decides every round — how a single
-SHA-256 hash becomes a fair multiplier with a 1% house edge and a heavy tail,
-and why it can run inside a TON contract with no floating point at all.
+A short write-up of the one function that decides every bet: how a single SHA-256
+hash becomes a multiplier with the same 1% house edge at every target, and why it
+can run inside a TON contract with no floating point at all.
 
 The whole thing is this:
 
@@ -14,134 +14,115 @@ fun crashFrom(seed: String, clientSeed: String, nonce: Int): Int {
     sb.append(clientSeed);
     sb.append(":");
     sb.append(nonce.toString());
-
-    let hash: Int = sha256(sb.toString());
-    let h: Int = hash >> 204;              // top 52 bits
-    if (h == 0) { h = 1 }
-
-    let x100: Int = (100 * E - h) / (E - h);   // E = 2^52
-    if (x100 < 100) { x100 = 100 }
-    return x100;
+    let h: Int = sha256(sb.toString()) >> 204;     // top 52 bits
+    return max(99 * E / (E - h), 100);              // E = 2^52
 }
 ```
 
-Let me go through it line by line.
+## 1. Build the input
 
-## 1. Build the round's input
+Every bet is identified by three things: the secret `seed` (hidden until the reveal),
+the player's `clientSeed` and a `nonce`. Joining them as `seed:client:nonce` gives
+every bet a unique input. The player's seed is in there on purpose: the owner commits
+to the seed before any bet, so it cannot pick a seed that is bad for a bet it has not
+seen yet.
 
-```tact
-sb.append(seed); sb.append(":"); sb.append(clientSeed); sb.append(":"); sb.append(nonce.toString());
-```
-
-Every round is identified by three things: the secret `seed` (hidden until
-reveal), the player's `clientSeed`, and a `nonce` that counts up each round.
-Joining them as `seed:client:nonce` gives every round a unique input. The
-player's seed is in there on purpose — it stops the operator from picking a
-seed that produces nice numbers for itself.
+The string can always be split back into its parts: the seed is hex and the nonce is
+digits, so neither contains a colon.
 
 ## 2. Hash it
 
 ```tact
-let hash: Int = sha256(sb.toString());
+let h: Int = sha256(sb.toString()) >> 204;   // 256 - 52 = 204
 ```
 
-SHA-256 turns that string into a 256-bit number that is, for all practical
-purposes, uniformly random and impossible to steer. Same string in, same hash
-out — on the contract, on the server, in the browser. That determinism is the
-whole point: anyone can recompute it.
+SHA-256 turns the string into a 256-bit number that nobody can steer. Same string in,
+same hash out: on the contract, on the server, in the browser. Shifting right by 204
+keeps the top 52 bits, so `h` is a uniform integer in `[0, 2^52)`. 52 bits is also the
+largest integer a double holds exactly, which keeps a JavaScript client simple.
 
-## 3. Take the top 52 bits
+One detail matters here. Tact's `sha256()` hashes the whole string, also when it
+spans several cells (longer than 127 bytes). The cheaper `hashData()` only hashes the
+first 127 bytes, and with a long client seed it would give a different number than
+every off-chain implementation. That is not an edge case: a seed of 64 hex
+characters and a 64-byte client seed already make a 140-byte string. The tests check
+such an input against an independent implementation.
+
+## 3. The formula
 
 ```tact
-let h: Int = hash >> 204;   // 256 - 52 = 204
+max(99 * E / (E - h), 100)
 ```
 
-We only need a slice of that entropy. Shifting right by 204 keeps the top 52
-bits, so `h` is a uniform integer in `[0, 2^52)`.
+Write `u = h / E`, so `u` is uniform in `[0, 1)`. The result is `0.99 / (1 − u)` in
+hundredths of a multiplier, rounded down: `100` means 1.00×, `247` means 2.47×.
 
-Why 52? It's the width [bustabit](https://bustabit.com) uses, and it's the
-largest integer a double can hold exactly — handy if you ever want a JS client
-to match without BigInt surprises. `E = 2^52 = 4503599627370496`.
+- A result of at least `T` hundredths needs `h ≥ E − 99E/T`, which holds for
+  `floor(99E/T)` of the `E` equally likely values of `h`. So
+  `P(crash ≥ t) = 0.99 / t`.
+- A bet on `t` pays `t` times the stake, so its expected return is
+  `t × 0.99 / t = 0.99`. The edge is 1% for every target from 1.01× to 100×, and the
+  tests check that for all 9,900 targets exactly, not by sampling.
+- About 1.98% of rounds end at 1.00×, where every bet loses. The median is 1.98×.
 
-## 4. The formula
+No floats anywhere: the TON VM doesn't have them, and it doesn't need them.
 
-```tact
-let x100: Int = (100 * E - h) / (E - h);
-```
+### Measured
 
-This is the part that looks like magic. Write `u = h / E`, so `u` is uniform in
-`[0, 1)`. Then:
-
-```
-(100E − h) / (E − h)  =  (100 − u) / (1 − u)
-```
-
-- when `u → 0`   → `100`   (i.e. 1.00×, the floor)
-- when `u = 0.5` → `199`   (1.99×)
-- when `u → 1`   → `∞`     (rare huge multipliers — the heavy tail)
-
-Integer division floors the result, and everything is `×100`, so `247` means
-`2.47×`. No floats anywhere — the TON VM doesn't have them, and it doesn't need
-them.
-
-### Where the 1% edge hides
-
-The result equals exactly `100` (a `1.00×` instant crash) when
-
-```
-(100E − h) / (E − h) < 101   ⟺   h < E / 100
-```
-
-`h` is uniform on `[0, E)`, so that's a clean **1% of rounds**. No separate
-"house edge" branch bolted on — it falls straight out of the formula.
-
-### The survival curve
-
-Solving `result ≥ t` gives `P(crash ≥ t) = 0.99 / t`. That's a power law: on a
-log-log plot it's a straight line. I ran 300,000 rounds through the exact
-contract formula and plotted the measured probabilities against `0.99/t`:
+300,000 rounds through the contract formula (`python3 docs/measure.py`):
 
 ![crash distribution](distribution.svg)
 
-The dots (measured) sit right on the line (theory) across two orders of
-magnitude. Numbers:
-
 | cash-out target | measured | theory `0.99/t` |
 |-----------------|----------|-----------------|
-| 1.5× | 66.42% | 66.00% |
-| 2×   | 49.70% | 49.50% |
-| 3×   | 33.13% | 33.00% |
-| 5×   | 19.85% | 19.80% |
-| 10×  |  9.95% |  9.90% |
-| 50×  |  2.01% |  1.98% |
-| 100× |  0.99% |  0.99% |
+| 1.01× | 98.01% | 98.02% |
+| 1.5×  | 65.95% | 66.00% |
+| 2×    | 49.53% | 49.50% |
+| 3×    | 32.88% | 33.00% |
+| 5×    | 19.71% | 19.80% |
+| 10×   |  9.89% |  9.90% |
+| 50×   |  2.00% |  1.98% |
+| 100×  |  1.00% |  0.99% |
 
-Instant `1.00×` came out at **0.99%** against a 1.00% target, and the median
-round is **1.98×**. The math holds.
+## What the first version got wrong
 
-## 5. Same numbers off-chain
+The first version used `(100E − h) / (E − h)`, which is `(100 − u) / (1 − u)`. It
+crashes at 1.00× in exactly 1% of rounds, and this document called that the house
+edge. It is not. For that formula `P(crash ≥ t) = 0.99 / (t − 0.01)`, so the expected
+edge depends on the target:
 
-The reason this can be trusted is that it isn't only the contract that can
-compute it. Here's the identical formula in TypeScript, which the test suite
-uses to cross-check every round:
+![house edge by target](edge.svg)
+
+| target | edge, first version | edge, now |
+|--------|---------------------|-----------|
+| 1.01× | 0.01% | 1.00% |
+| 1.5×  | 0.34% | 1.00% |
+| 2×    | 0.50% | 1.00% |
+| 10×   | 0.90% | 1.00% |
+| 100×  | 0.99% | 1.00% |
+
+The measurements had shown it all along: the old table listed 49.70% at 2× against
+a "theory" of 49.50%, and `0.99 / (t − 0.01)` gives 49.75%. The difference looked like
+noise, so nobody checked the theory.
+
+## 4. Same numbers off-chain
+
+The reason this can be trusted is that the contract is not the only thing that can
+compute it. The tests use this TypeScript copy to check the contract:
 
 ```ts
-const E = 4503599627370496n; // 2^52
+const E = 1n << 52n;
 function crash(seed: string, client: string, nonce: number): bigint {
-    const hash = BigInt('0x' + sha256(`${seed}:${client}:${nonce}`).toString('hex'));
-    let h = hash >> 204n;
-    if (h === 0n) h = 1n;
-    let x100 = (100n * E - h) / (E - h);
+    const h = BigInt('0x' + sha256(`${seed}:${client}:${nonce}`).toString('hex')) >> 204n;
+    const x100 = (99n * E) / (E - h);
     return x100 < 100n ? 100n : x100;
 }
 ```
 
-The test asks the contract for a multiplier and compares it to this function
-for several nonces. They match byte for byte — which means a player never has
-to trust the operator's number. They can recompute it themselves, or read it
-straight off the chain.
+The off-chain game, [abyss-casino](https://github.com/vladslugin/abyss-casino), uses
+the same formula in Python and in the browser, so any of its rounds can be checked
+with the contract's `crashPoint` getter once the seed is revealed.
 
 ---
 
-*Part of [ton-abyss](../README.md). The off-chain game is
-[abyss-casino](https://github.com/vladslugin/abyss-casino).*
+*Part of [ton-abyss](../README.md).*

@@ -15,6 +15,7 @@ export async function run(provider: NetworkProvider) {
     await provider.waitForDeploy(fairness.address);
 
     console.log('Fairness deployed at', fairness.address.toString());
-    console.log('owner        ', (await fairness.getOwner()).toString());
-    console.log('roundsPlayed ', await fairness.getRoundsPlayed());
+    console.log('owner ', (await fairness.getOwner()).toString());
+    console.log('round ', await fairness.getRound());
+    console.log('Send "fund" with at least 0.6 TON before the first Open.');
 }
